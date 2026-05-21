@@ -96,4 +96,53 @@ grep -q 'base alpha' notes.txt
 ! grep -q 'layer charlie' notes.txt
 grep -q 'user delta' notes.txt
 
+if command -v git-crypt >/dev/null 2>&1; then
+  tmp_crypt="$tmp/git-crypt-layer"
+  mkdir "$tmp_crypt"
+  cd "$tmp_crypt"
+  git init -q --initial-branch=main
+  git config user.email layers@example.local
+  git config user.name "Git Layers Test"
+  git-crypt init >/dev/null
+  printf 'secret.txt filter=git-crypt diff=git-crypt\n' > .gitattributes
+  printf 'line one\nline two\nline three\n' > README.md
+  printf 'base secret\n' > secret.txt
+  git add .gitattributes README.md secret.txt
+  git commit -m "base" >/dev/null
+
+  git checkout -q -b layer/secret
+  perl -0pi -e 's/line three/layer line three/' README.md
+  printf 'layer secret\n' > secret.txt
+  git commit -am "layer encrypted file" >/dev/null
+
+  git checkout -q main
+  perl -0pi -e 's/line one/base line one/' README.md
+  git commit -am "base moved" >/dev/null
+
+  git layers apply-ref layer/secret --name secret-layer >/dev/null
+  test -z "$(git status --short)"
+  grep -q 'layer line three' README.md
+  grep -q 'layer secret' secret.txt
+
+  printf 'updated secret\n' > secret.txt
+  git layers commit secret-layer -m "update encrypted layer secret" >/dev/null
+  git show layer/secret:secret.txt | git-crypt smudge | grep -q 'updated secret'
+  ! git show layer/secret:secret.txt | LC_ALL=C grep -q 'updated secret'
+  test -z "$(git status --short)"
+
+  git layers unapply secret-layer >/dev/null
+  test -z "$(git status --short)"
+  ! grep -q 'layer line three' README.md
+  grep -q 'base line one' README.md
+
+  git checkout -q -b layer/readme-only main
+  perl -0pi -e 's/line two/layer line two/' README.md
+  git commit -am "layer readme only" >/dev/null
+  git checkout -q main
+  git-crypt lock
+  git layers apply-ref layer/readme-only --name readme-layer >/dev/null
+  test -z "$(git status --short)"
+  grep -q 'layer line two' README.md
+fi
+
 echo "smoke ok"

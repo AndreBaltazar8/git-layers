@@ -70,10 +70,12 @@ git status --short
 ```
 
 `apply-ref` finds the merge base between `HEAD` and the layer ref, asks Git to
-merge the layer ref into a temporary worktree, then materializes only the
-resulting changed files into `.git/layers/refs/<name>`. That means changes made
-on the base branch after the split are preserved, while the layer branch changes
-are subtracted from normal `git diff`, `git status`, and `git add`.
+merge the refs with `git merge-tree --write-tree`, then materializes only the
+resulting changed blobs into `.git/layers/refs/<name>`. This avoids internal
+checkout/smudge steps, so repositories with filters such as `git-crypt` do not
+fail just because an encrypted file exists. Changes made on the base branch
+after the split are preserved, while the layer branch changes are subtracted
+from normal `git diff`, `git status`, and `git add`.
 
 If the layer ref is a local branch, `git layers commit` commits layer overlay
 changes on top of that branch:
@@ -178,9 +180,16 @@ or unapply the layer first.
 deletes a path, the command stops instead of guessing how that deletion should
 interact with local edits.
 
+`apply-ref` requires a Git version with `git merge-tree --write-tree`.
+
 For `apply-ref`, `git layers commit` currently commits overlay/new-file changes
 back to the source branch. Partial tracked-file hunks are validated but not
 inferred as layer edits; edit those directly on the layer branch for now.
+
+For `git-crypt` paths, ref-backed layers use full-file overlay mode instead of
+partial UTF-8 hunks. If an encrypted path changed in the layer ref, the base repo
+must be unlocked so the layer can materialize plaintext into the working tree
+and encrypt it again when committing back to the layer branch.
 
 For private secrets, commit the layer repo only to a private remote. This plugin
 keeps secrets out of the base repo; it does not encrypt the layer repo.

@@ -52,21 +52,47 @@ def run_git(
     *,
     check: bool = True,
     stdin: bytes | None = None,
-    config: list[str] | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    config_args: list[str] = []
-    for item in config or []:
-        config_args.extend(["-c", item])
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
     result = subprocess.run(
-        ["git", *config_args, *args],
+        ["git", *args],
         cwd=str(cwd),
         input=stdin,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=run_env,
     )
     if check and result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
+        raise LayerError(f"git {' '.join(args)} failed: {detail}")
+    return result
+
+
+def run_git_bytes(
+    args: list[str],
+    cwd: Path,
+    *,
+    check: bool = True,
+    stdin: bytes | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
+    result = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        input=stdin,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=run_env,
+    )
+    if check and result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip() or result.stdout.decode(errors="replace").strip()
         raise LayerError(f"git {' '.join(args)} failed: {detail}")
     return result
 
@@ -377,13 +403,47 @@ def configure_filter(root: Path, name: str, enabled: bool) -> None:
     run_git(["config", "--local", f"filter.{driver}.required", "true"], root)
 
 
-def disable_filter_config(name: str) -> list[str]:
-    driver = filter_driver_name(name)
-    return [
-        f"filter.{driver}.clean=cat",
-        f"filter.{driver}.smudge=cat",
-        f"filter.{driver}.required=false",
-    ]
+def path_filter_attr(root: Path, rel: str) -> str | None:
+    result = run_git(["check-attr", "-z", "filter", "--", rel], root, check=False)
+    parts = zsplit(result.stdout)
+    if len(parts) >= 3 and parts[1] == "filter" and parts[2] not in ("unspecified", "unset"):
+        return parts[2]
+    return None
+
+
+def is_git_crypt_path(root: Path, rel: str) -> bool:
+    return path_filter_attr(root, rel) == "git-crypt"
+
+
+def run_git_crypt_filter(root: Path, direction: str, content: bytes, rel: str) -> bytes:
+    try:
+        result = subprocess.run(
+            ["git-crypt", direction],
+            cwd=str(root),
+            input=content,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise LayerError(f"cannot run git-crypt for {rel}: {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip() or result.stdout.decode(errors="replace").strip()
+        action = "decrypt" if direction == "smudge" else "encrypt"
+        raise LayerError(f"cannot {action} git-crypt path {rel}; unlock the repository first ({detail})")
+    return result.stdout
+
+
+def worktree_blob_from_tree(root: Path, treeish: str, rel: str) -> bytes:
+    content = run_git_bytes(["cat-file", "blob", f"{treeish}:{rel}"], root).stdout
+    if is_git_crypt_path(root, rel):
+        return run_git_crypt_filter(root, "smudge", content, rel)
+    return content
+
+
+def clean_blob_for_tree(root: Path, rel: str, content: bytes) -> bytes:
+    if is_git_crypt_path(root, rel):
+        return run_git_crypt_filter(root, "clean", content, rel)
+    return content
 
 
 def refresh_index(root: Path, paths: list[str]) -> None:
@@ -666,44 +726,24 @@ def materialize_ref_layer(root: Path, ref: str, base_ref: str, name: str) -> tup
     materialized.mkdir(parents=True)
 
     try:
-        worktree_path: Path | None = None
-        with tempfile.TemporaryDirectory(prefix="git-layers-ref-") as tmp:
-            worktree_path = Path(tmp) / "worktree"
-            try:
-                run_git(["worktree", "add", "--detach", str(worktree_path), base_commit], root)
-                merge = run_git(["merge", "--no-commit", "--no-ff", layer_commit], worktree_path, check=False)
-                if merge.returncode != 0:
-                    conflicts = run_git(
-                        ["diff", "--name-only", "--diff-filter=U"],
-                        worktree_path,
-                        check=False,
-                    ).stdout.splitlines()
-                    conflict_text = f": {', '.join(conflicts)}" if conflicts else ""
-                    detail = merge.stderr.strip() or merge.stdout.strip()
-                    raise LayerError(
-                        f"ref layer merge has conflicts{conflict_text}" + (f"\n{detail}" if detail else "")
-                    )
+        merge = run_git(["merge-tree", "--write-tree", base_commit, layer_commit], root, check=False)
+        if merge.returncode != 0:
+            detail = merge.stderr.strip() or merge.stdout.strip()
+            raise LayerError(f"ref layer merge has conflicts" + (f"\n{detail}" if detail else ""))
+        merged_tree = merge.stdout.splitlines()[0].strip()
 
-                deleted = zsplit(
-                    run_git(["diff", "--name-only", "-z", "--diff-filter=D", "HEAD"], worktree_path).stdout
-                )
-                if deleted:
-                    raise LayerError(
-                        "apply-ref does not yet support layer deletions; deleted path(s): "
-                        + ", ".join(deleted)
-                    )
+        deleted = zsplit(run_git(["diff", "--name-only", "-z", "--diff-filter=D", base_commit, merged_tree], root).stdout)
+        if deleted:
+            raise LayerError(
+                "apply-ref does not yet support layer deletions; deleted path(s): "
+                + ", ".join(deleted)
+            )
 
-                changed = zsplit(
-                    run_git(["diff", "--name-only", "-z", "--diff-filter=ACMRT", "HEAD"], worktree_path).stdout
-                )
-                for rel in changed:
-                    source = worktree_path / rel
-                    if source.is_dir() and not source.is_symlink():
-                        raise LayerError(f"apply-ref does not support directory-like gitlink path: {rel}")
-                    copy_path(source, materialized / rel)
-            finally:
-                if worktree_path and worktree_path.exists():
-                    run_git(["worktree", "remove", "--force", str(worktree_path)], root, check=False)
+        changed = zsplit(
+            run_git(["diff", "--name-only", "-z", "--diff-filter=ACMRT", base_commit, merged_tree], root).stdout
+        )
+        for rel in changed:
+            write_bytes(materialized / rel, worktree_blob_from_tree(root, merged_tree, rel))
     except Exception:
         shutil.rmtree(materialized, ignore_errors=True)
         raise
@@ -716,6 +756,7 @@ def materialize_ref_layer(root: Path, ref: str, base_ref: str, name: str) -> tup
         "base_ref": base_ref,
         "base_commit": base_commit,
         "merge_base": merge_base,
+        "merged_tree": merged_tree,
         "materialized_at": now_iso(),
     }
     return materialized, metadata
@@ -772,7 +813,7 @@ def apply_layer(
             "applied_sha256": None,
             "mode": "overlay",
         }
-        if tracked and partial:
+        if tracked and partial and not is_git_crypt_path(root, rel):
             base = git_show_path(root, rel)
             if base is None:
                 raise LayerError(f"cannot build partial patch for missing HEAD path: {rel}")
@@ -1148,6 +1189,26 @@ def ref_layer_branch(manifest: dict[str, Any]) -> str:
     return ref
 
 
+def layer_file_bytes_and_mode(path: Path) -> tuple[bytes, str]:
+    if path.is_symlink():
+        return os.readlink(path).encode(), "120000"
+    data = path.read_bytes()
+    mode = "100755" if os.access(path, os.X_OK) else "100644"
+    return data, mode
+
+
+def tree_path_mode(root: Path, treeish: str, rel: str) -> str | None:
+    result = run_git(["ls-tree", "-z", treeish, "--", rel], root, check=False)
+    if result.returncode != 0 or not result.stdout:
+        return None
+    head = result.stdout.split("\t", 1)[0]
+    return head.split(" ", 1)[0] if head else None
+
+
+def write_blob(root: Path, content: bytes) -> str:
+    return run_git_bytes(["hash-object", "-w", "--stdin"], root, stdin=content).stdout.decode().strip()
+
+
 def command_commit_ref_layer(
     root: Path,
     name: str,
@@ -1171,32 +1232,25 @@ def command_commit_ref_layer(
         return 0
 
     new_commit = current_commit
-    worktree_path: Path | None = None
-    no_filter = disable_filter_config(name)
     with tempfile.TemporaryDirectory(prefix="git-layers-commit-ref-") as tmp:
-        worktree_path = Path(tmp) / "worktree"
-        try:
-            run_git(["worktree", "add", "--detach", str(worktree_path), current_commit], root, config=no_filter)
-            for rel in commit_paths:
-                copy_path(layer / rel, worktree_path / rel)
-            if commit_paths:
-                run_git(["add", "--", *commit_paths], worktree_path, config=no_filter)
+        index_env = {"GIT_INDEX_FILE": str(Path(tmp) / "index")}
+        run_git(["read-tree", current_commit], root, env=index_env)
+        for rel in commit_paths:
+            content, fallback_mode = layer_file_bytes_and_mode(layer / rel)
+            mode = tree_path_mode(root, current_commit, rel) or fallback_mode
+            content = clean_blob_for_tree(root, rel, content)
+            blob = write_blob(root, content)
+            run_git(["update-index", "--add", "--cacheinfo", f"{mode},{blob},{rel}"], root, env=index_env)
 
-            status = run_git(["status", "--porcelain=v1"], worktree_path, config=no_filter).stdout.strip()
-            if not status and not args.allow_empty:
-                print(f"nothing to commit in ref layer {name}")
-                return 0
+        new_tree = run_git(["write-tree"], root, env=index_env).stdout.strip()
+        has_changes = run_git(["diff-tree", "--quiet", current_commit, new_tree], root, check=False).returncode != 0
+        if not has_changes and not args.allow_empty:
+            print(f"nothing to commit in ref layer {name}")
+            return 0
 
-            commit_args = ["commit"]
-            if args.allow_empty:
-                commit_args.append("--allow-empty")
-            commit_args.extend(["-m", args.message])
-            run_git(commit_args, worktree_path, config=no_filter)
-            new_commit = run_git(["rev-parse", "HEAD"], worktree_path, config=no_filter).stdout.strip()
-            run_git(["update-ref", branch_ref, new_commit, current_commit], root)
-        finally:
-            if worktree_path and worktree_path.exists():
-                run_git(["worktree", "remove", "--force", str(worktree_path)], root, check=False)
+        commit_args = ["commit-tree", new_tree, "-p", current_commit, "-m", args.message]
+        new_commit = run_git(commit_args, root).stdout.strip()
+        run_git(["update-ref", branch_ref, new_commit, current_commit], root)
 
     manifest["source_commit"] = new_commit
     manifest["source_ref_full"] = branch_ref
