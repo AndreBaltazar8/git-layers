@@ -61,6 +61,31 @@ With `--partial`, tracked files from the layer are installed as patch hunks.
 Untracked files from the same layer are still installed as private overlay
 files.
 
+Apply a layer from another ref in the same repository:
+
+```sh
+cd /path/to/base-repo
+git layers apply-ref my-layer-branch --name local
+git status --short
+```
+
+`apply-ref` finds the merge base between `HEAD` and the layer ref, asks Git to
+merge the layer ref into a temporary worktree, then materializes only the
+resulting changed files into `.git/layers/refs/<name>`. That means changes made
+on the base branch after the split are preserved, while the layer branch changes
+are subtracted from normal `git diff`, `git status`, and `git add`.
+
+If the layer ref is a local branch, `git layers commit` commits layer overlay
+changes on top of that branch:
+
+```sh
+printf 'TOKEN=updated\n' > .env
+git layers commit local -m "Update local env"
+```
+
+The branch must still point at the same commit it had when the layer was
+applied; if it moved, unapply and reapply before committing the layer.
+
 Create an empty Git-backed layer and start tracking local files:
 
 ```sh
@@ -105,6 +130,7 @@ git layers unapply local
 ```text
 git layers init <layer-dir> [--name NAME] [--apply]
 git layers apply <layer-dir> [--name NAME] [--partial] [--force] [--allow-empty]
+git layers apply-ref <ref> [--base REF] [--name NAME] [--overlay] [--force] [--allow-empty]
 git layers track [--layer NAME] [--mode auto|partial|overlay] [--force] <path>...
 git layers save [NAME]
 git layers commit [NAME] -m "message" [--init] [--allow-empty]
@@ -147,6 +173,14 @@ conflict instead of guessing.
 Full-file overlay mode still has normal `skip-worktree` limitations: if a
 layered tracked file also needs a real base-repo edit, use partial mode instead
 or unapply the layer first.
+
+`apply-ref` currently supports added and modified paths. If the layer branch
+deletes a path, the command stops instead of guessing how that deletion should
+interact with local edits.
+
+For `apply-ref`, `git layers commit` currently commits overlay/new-file changes
+back to the source branch. Partial tracked-file hunks are validated but not
+inferred as layer edits; edit those directly on the layer branch for now.
 
 For private secrets, commit the layer repo only to a private remote. This plugin
 keeps secrets out of the base repo; it does not encrypt the layer repo.

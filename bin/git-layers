@@ -22,6 +22,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -51,9 +52,13 @@ def run_git(
     *,
     check: bool = True,
     stdin: bytes | None = None,
+    config: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    config_args: list[str] = []
+    for item in config or []:
+        config_args.extend(["-c", item])
     result = subprocess.run(
-        ["git", *args],
+        ["git", *config_args, *args],
         cwd=str(cwd),
         input=stdin,
         stdout=subprocess.PIPE,
@@ -64,6 +69,10 @@ def run_git(
         detail = result.stderr.strip() or result.stdout.strip()
         raise LayerError(f"git {' '.join(args)} failed: {detail}")
     return result
+
+
+def zsplit(output: str) -> list[str]:
+    return [item for item in output.split("\0") if item]
 
 
 def repo_root() -> Path:
@@ -100,6 +109,10 @@ def manifest_path(root: Path, name: str) -> Path:
 
 def backup_root(root: Path, name: str) -> Path:
     return state_root(root) / name / "backup"
+
+
+def ref_layers_root(root: Path) -> Path:
+    return layers_dir(root) / "refs"
 
 
 def now_iso() -> str:
@@ -210,7 +223,7 @@ def get_tracked_paths(root: Path) -> set[str]:
     result = run_git(["ls-files", "-z"], root)
     if not result.stdout:
         return set()
-    return {item for item in result.stdout.split("\0") if item}
+    return set(zsplit(result.stdout))
 
 
 def status_for_path(root: Path, rel: str) -> str:
@@ -362,6 +375,15 @@ def configure_filter(root: Path, name: str, enabled: bool) -> None:
     run_git(["config", "--local", f"filter.{driver}.clean", clean], root)
     run_git(["config", "--local", f"filter.{driver}.smudge", smudge], root)
     run_git(["config", "--local", f"filter.{driver}.required", "true"], root)
+
+
+def disable_filter_config(name: str) -> list[str]:
+    driver = filter_driver_name(name)
+    return [
+        f"filter.{driver}.clean=cat",
+        f"filter.{driver}.smudge=cat",
+        f"filter.{driver}.required=false",
+    ]
 
 
 def refresh_index(root: Path, paths: list[str]) -> None:
@@ -619,15 +641,113 @@ def find_manifest_entry(manifest: dict[str, Any], rel: str) -> dict[str, Any] | 
     return None
 
 
-def command_apply(args: argparse.Namespace) -> int:
-    root = repo_root()
-    layer = Path(args.layer).expanduser().resolve()
-    name = sanitize_name(args.name or layer.name)
+def resolve_commit(root: Path, ref: str) -> str:
+    result = run_git(["rev-parse", "--verify", f"{ref}^{{commit}}"], root, check=False)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise LayerError(f"cannot resolve ref as a commit: {ref}" + (f" ({detail})" if detail else ""))
+    return result.stdout.strip()
+
+
+def remove_existing_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def materialize_ref_layer(root: Path, ref: str, base_ref: str, name: str) -> tuple[Path, dict[str, Any]]:
+    base_commit = resolve_commit(root, base_ref)
+    layer_commit = resolve_commit(root, ref)
+    source_ref_full = run_git(["rev-parse", "--symbolic-full-name", ref], root, check=False).stdout.strip()
+    merge_base = run_git(["merge-base", base_commit, layer_commit], root).stdout.strip()
+    materialized = ref_layers_root(root) / name
+    remove_existing_path(materialized)
+    materialized.mkdir(parents=True)
+
+    try:
+        worktree_path: Path | None = None
+        with tempfile.TemporaryDirectory(prefix="git-layers-ref-") as tmp:
+            worktree_path = Path(tmp) / "worktree"
+            try:
+                run_git(["worktree", "add", "--detach", str(worktree_path), base_commit], root)
+                merge = run_git(["merge", "--no-commit", "--no-ff", layer_commit], worktree_path, check=False)
+                if merge.returncode != 0:
+                    conflicts = run_git(
+                        ["diff", "--name-only", "--diff-filter=U"],
+                        worktree_path,
+                        check=False,
+                    ).stdout.splitlines()
+                    conflict_text = f": {', '.join(conflicts)}" if conflicts else ""
+                    detail = merge.stderr.strip() or merge.stdout.strip()
+                    raise LayerError(
+                        f"ref layer merge has conflicts{conflict_text}" + (f"\n{detail}" if detail else "")
+                    )
+
+                deleted = zsplit(
+                    run_git(["diff", "--name-only", "-z", "--diff-filter=D", "HEAD"], worktree_path).stdout
+                )
+                if deleted:
+                    raise LayerError(
+                        "apply-ref does not yet support layer deletions; deleted path(s): "
+                        + ", ".join(deleted)
+                    )
+
+                changed = zsplit(
+                    run_git(["diff", "--name-only", "-z", "--diff-filter=ACMRT", "HEAD"], worktree_path).stdout
+                )
+                for rel in changed:
+                    source = worktree_path / rel
+                    if source.is_dir() and not source.is_symlink():
+                        raise LayerError(f"apply-ref does not support directory-like gitlink path: {rel}")
+                    copy_path(source, materialized / rel)
+            finally:
+                if worktree_path and worktree_path.exists():
+                    run_git(["worktree", "remove", "--force", str(worktree_path)], root, check=False)
+    except Exception:
+        shutil.rmtree(materialized, ignore_errors=True)
+        raise
+
+    metadata = {
+        "source_type": "ref",
+        "source_ref": ref,
+        "source_ref_full": source_ref_full,
+        "source_commit": layer_commit,
+        "base_ref": base_ref,
+        "base_commit": base_commit,
+        "merge_base": merge_base,
+        "materialized_at": now_iso(),
+    }
+    return materialized, metadata
+
+
+def cleanup_internal_ref_layer(root: Path, manifest: dict[str, Any]) -> None:
+    if manifest.get("source_type") != "ref":
+        return
+    layer = Path(manifest.get("layer_dir", ""))
+    try:
+        layer.resolve().relative_to(ref_layers_root(root).resolve())
+    except (OSError, ValueError):
+        return
+    shutil.rmtree(layer, ignore_errors=True)
+
+
+def apply_layer(
+    root: Path,
+    layer: Path,
+    name: str,
+    *,
+    partial: bool,
+    force: bool,
+    allow_empty: bool,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    layer = layer.resolve()
     if manifest_path(root, name).exists():
         raise LayerError(f"layer is already applied: {name}")
 
     layer_files = list(iter_layer_files(layer))
-    if not layer_files and not args.allow_empty:
+    if not layer_files and not allow_empty:
         raise LayerError(f"layer has no files: {layer}")
 
     tracked_paths = get_tracked_paths(root)
@@ -643,7 +763,7 @@ def command_apply(args: argparse.Namespace) -> int:
         if target.exists() and target.is_dir() and not target.is_symlink():
             raise LayerError(f"refusing to replace directory with file: {rel}")
         tracked = rel in tracked_paths
-        require_clean_target(root, rel, tracked, args.force)
+        require_clean_target(root, rel, tracked, force)
         entry: dict[str, Any] = {
             "path": rel,
             "tracked": tracked,
@@ -652,7 +772,7 @@ def command_apply(args: argparse.Namespace) -> int:
             "applied_sha256": None,
             "mode": "overlay",
         }
-        if tracked and args.partial:
+        if tracked and partial:
             base = git_show_path(root, rel)
             if base is None:
                 raise LayerError(f"cannot build partial patch for missing HEAD path: {rel}")
@@ -681,6 +801,8 @@ def command_apply(args: argparse.Namespace) -> int:
             entry["applied_sha256"] = sha256_file(target)
 
         manifest = create_manifest(root, name, layer, entries)
+        if metadata:
+            manifest.update(metadata)
         save_manifest(root, name, manifest)
         install_layer_integration(root, name, manifest)
     except Exception:
@@ -693,7 +815,51 @@ def command_apply(args: argparse.Namespace) -> int:
         shutil.rmtree(state_dir, ignore_errors=True)
         raise
 
+    return manifest
+
+
+def command_apply(args: argparse.Namespace) -> int:
+    root = repo_root()
+    layer = Path(args.layer).expanduser().resolve()
+    name = sanitize_name(args.name or layer.name)
+    manifest = apply_layer(
+        root,
+        layer,
+        name,
+        partial=args.partial,
+        force=args.force,
+        allow_empty=args.allow_empty,
+    )
     print(f"applied layer {name} from {layer}")
+    print(f"partial tracked paths subtracted with filters: {len(manifest['filter_paths'])}")
+    print(f"tracked overlay paths hidden with skip-worktree: {len(manifest['skip_worktree_paths'])}")
+    print(f"untracked overlay paths hidden with .git/info/exclude: {len(manifest['exclude_paths'])}")
+    return 0
+
+
+def command_apply_ref(args: argparse.Namespace) -> int:
+    root = repo_root()
+    name = sanitize_name(args.name or args.ref)
+    materialized: Path | None = None
+    try:
+        materialized, metadata = materialize_ref_layer(root, args.ref, args.base, name)
+        manifest = apply_layer(
+            root,
+            materialized,
+            name,
+            partial=not args.overlay,
+            force=args.force,
+            allow_empty=args.allow_empty,
+            metadata=metadata,
+        )
+    except Exception:
+        if materialized is not None:
+            shutil.rmtree(materialized, ignore_errors=True)
+        raise
+
+    print(f"applied ref layer {name} from {args.ref}")
+    print(f"base ref: {args.base}")
+    print(f"merge base: {manifest['merge_base'][:12]}")
     print(f"partial tracked paths subtracted with filters: {len(manifest['filter_paths'])}")
     print(f"tracked overlay paths hidden with skip-worktree: {len(manifest['skip_worktree_paths'])}")
     print(f"untracked overlay paths hidden with .git/info/exclude: {len(manifest['exclude_paths'])}")
@@ -762,6 +928,7 @@ def command_unapply(args: argparse.Namespace) -> int:
 
     uninstall_layer_integration(root, name, manifest)
     refresh_index_if_unchanged(root, sorted(entry["path"] for entry in paths if entry.get("tracked")))
+    cleanup_internal_ref_layer(root, manifest)
     shutil.rmtree(state_root(root) / name)
     print(f"unapplied layer {name}")
     return 0
@@ -827,9 +994,23 @@ def command_save(args: argparse.Namespace) -> int:
     root = repo_root()
     name = resolve_layer_name(root, args.name)
     manifest = load_manifest(root, name)
-    changed = save_layer(root, name, manifest)
+    changed = save_ref_layer(root, name, manifest) if manifest.get("source_type") == "ref" else save_layer(root, name, manifest)
     print(f"saved {changed} changed path(s) back to layer {name}")
     return 0
+
+
+def save_overlay_entry(root: Path, layer: Path, entry: dict[str, Any]) -> bool:
+    rel = entry["path"]
+    target = root / rel
+    destination = layer / rel
+    if not target.exists() and not target.is_symlink():
+        raise LayerError(f"cannot save missing worktree path: {rel}")
+    before = sha256_file(destination)
+    copy_path(target, destination)
+    after = sha256_file(destination)
+    entry["source_sha256"] = after
+    entry["applied_sha256"] = sha256_file(target)
+    return before != after
 
 
 def save_layer(root: Path, name: str, manifest: dict[str, Any]) -> int:
@@ -842,20 +1023,46 @@ def save_layer(root: Path, name: str, manifest: dict[str, Any]) -> int:
         rel = entry["path"]
         target = root / rel
         destination = layer / rel
-        before = sha256_file(destination)
         if entry_mode(entry) == "partial":
+            before = sha256_file(destination)
             base = git_show_path(root, rel)
             if base is None:
                 raise LayerError(f"cannot save partial layer for missing HEAD path: {rel}")
             write_bytes(destination, transform_with_hunks(base, entry.get("hunks", []), "smudge", rel))
+            after = sha256_file(destination)
+            entry["source_sha256"] = after
+            entry["applied_sha256"] = sha256_file(target)
+            if before != after:
+                changed += 1
         else:
-            if not target.exists() and not target.is_symlink():
-                raise LayerError(f"cannot save missing worktree path: {rel}")
-            copy_path(target, destination)
-        after = sha256_file(destination)
-        entry["source_sha256"] = after
-        entry["applied_sha256"] = sha256_file(target)
-        if before != after:
+            if save_overlay_entry(root, layer, entry):
+                changed += 1
+
+    manifest["saved_at"] = now_iso()
+    save_manifest(root, name, manifest)
+    return changed
+
+
+def save_ref_layer(root: Path, name: str, manifest: dict[str, Any]) -> int:
+    layer = Path(manifest["layer_dir"])
+    if not layer.is_dir():
+        raise LayerError(f"layer source directory is missing: {layer}")
+
+    changed = 0
+    for entry in manifest["paths"]:
+        rel = entry["path"]
+        target = root / rel
+        if entry_mode(entry) == "partial":
+            try:
+                transform_with_hunks(read_bytes_or_empty(target), entry.get("hunks", []), "clean", rel)
+            except LayerError as exc:
+                raise LayerError(
+                    f"cannot save ref layer edits inside partial hunk for {rel}; "
+                    "commit base edits normally, or edit the layer branch directly"
+                ) from exc
+            entry["applied_sha256"] = sha256_file(target)
+            continue
+        if save_overlay_entry(root, layer, entry):
             changed += 1
 
     manifest["saved_at"] = now_iso()
@@ -931,10 +1138,81 @@ def command_track(args: argparse.Namespace) -> int:
     return 0
 
 
+def ref_layer_branch(manifest: dict[str, Any]) -> str:
+    ref = manifest.get("source_ref_full") or manifest.get("source_ref", "")
+    if not ref.startswith("refs/heads/"):
+        raise LayerError(
+            "committing an apply-ref layer requires a local branch ref; "
+            f"got {manifest.get('source_ref', '<unknown>')}"
+        )
+    return ref
+
+
+def command_commit_ref_layer(
+    root: Path,
+    name: str,
+    manifest: dict[str, Any],
+    args: argparse.Namespace,
+) -> int:
+    branch_ref = ref_layer_branch(manifest)
+    expected_commit = manifest.get("source_commit")
+    current_commit = resolve_commit(root, branch_ref)
+    if expected_commit and current_commit != expected_commit:
+        raise LayerError(
+            f"{branch_ref} moved since layer {name} was applied; "
+            "unapply and reapply before committing to the layer ref"
+        )
+
+    changed = save_ref_layer(root, name, manifest)
+    layer = Path(manifest["layer_dir"])
+    commit_paths = [entry["path"] for entry in manifest["paths"] if entry_mode(entry) != "partial"]
+    if not commit_paths and not args.allow_empty:
+        print(f"nothing to commit in ref layer {name}")
+        return 0
+
+    new_commit = current_commit
+    worktree_path: Path | None = None
+    no_filter = disable_filter_config(name)
+    with tempfile.TemporaryDirectory(prefix="git-layers-commit-ref-") as tmp:
+        worktree_path = Path(tmp) / "worktree"
+        try:
+            run_git(["worktree", "add", "--detach", str(worktree_path), current_commit], root, config=no_filter)
+            for rel in commit_paths:
+                copy_path(layer / rel, worktree_path / rel)
+            if commit_paths:
+                run_git(["add", "--", *commit_paths], worktree_path, config=no_filter)
+
+            status = run_git(["status", "--porcelain=v1"], worktree_path, config=no_filter).stdout.strip()
+            if not status and not args.allow_empty:
+                print(f"nothing to commit in ref layer {name}")
+                return 0
+
+            commit_args = ["commit"]
+            if args.allow_empty:
+                commit_args.append("--allow-empty")
+            commit_args.extend(["-m", args.message])
+            run_git(commit_args, worktree_path, config=no_filter)
+            new_commit = run_git(["rev-parse", "HEAD"], worktree_path, config=no_filter).stdout.strip()
+            run_git(["update-ref", branch_ref, new_commit, current_commit], root)
+        finally:
+            if worktree_path and worktree_path.exists():
+                run_git(["worktree", "remove", "--force", str(worktree_path)], root, check=False)
+
+    manifest["source_commit"] = new_commit
+    manifest["source_ref_full"] = branch_ref
+    manifest["committed_at"] = now_iso()
+    save_manifest(root, name, manifest)
+    print(f"committed ref layer {name} at {new_commit[:7]} on {branch_ref} ({changed} saved path(s) changed)")
+    return 0
+
+
 def command_commit(args: argparse.Namespace) -> int:
     root = repo_root()
     name = resolve_layer_name(root, args.name)
     manifest = load_manifest(root, name)
+    if manifest.get("source_type") == "ref":
+        return command_commit_ref_layer(root, name, manifest, args)
+
     layer = Path(manifest["layer_dir"])
     ensure_layer_git_repo(layer, init=args.init)
 
@@ -1049,6 +1327,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="use clean/smudge filters for tracked files so normal Git subtracts layer hunks",
     )
     apply_parser.set_defaults(func=command_apply)
+
+    apply_ref_parser = sub.add_parser("apply-ref", help="apply a layer derived from another ref in this repo")
+    apply_ref_parser.add_argument("ref", help="branch, tag, or commit to use as the layer source")
+    apply_ref_parser.add_argument("--base", default="HEAD", help="base ref to apply onto; defaults to HEAD")
+    apply_ref_parser.add_argument("--name", help="stable name for the applied layer")
+    apply_ref_parser.add_argument("--force", action="store_true", help="overwrite dirty target paths")
+    apply_ref_parser.add_argument("--allow-empty", action="store_true", help="apply a ref layer with no changes")
+    apply_ref_parser.add_argument(
+        "--overlay",
+        action="store_true",
+        help="use full-file overlays for tracked files instead of partial filters",
+    )
+    apply_ref_parser.set_defaults(func=command_apply_ref)
 
     unapply_parser = sub.add_parser("unapply", help="remove an applied layer and restore backups")
     unapply_parser.add_argument("name", nargs="?", help="layer name; optional when only one is applied")
