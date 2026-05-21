@@ -7,17 +7,10 @@ It is useful for files like `.env`, local README overrides, private config, or
 machine-specific scripts. Layer files are copied into the worktree, but the
 plugin subtracts those paths from normal base-repo commits:
 
-- partial patches for tracked files use local Git attributes and clean/smudge
-  filters
-- tracked full-file overlays can be hidden with Git's local `skip-worktree`
-  index bit
-- untracked layer-only files are hidden in `.git/info/exclude`
-- layer state and backups live under `.git/layers`
+- partial patches for tracked files are hidden from normal base commits
+- layer-only files like `.env` stay local to the base worktree
+- multiple partial layers can stack on the same tracked file
 - layer contents can be their own Git repository and committed separately
-
-By default, generated attributes are local to the base repository in
-`.git/info/attributes`, so the base repo does not need a committed
-`.gitattributes` file.
 
 ## Normal Git Commands
 
@@ -25,7 +18,8 @@ This does not intercept or replace built-in Git commands. Git plugins can add
 commands like `git layers`, but they cannot transparently override built-ins
 like `git diff` or `git status`.
 
-Instead, `git-layers` subtracts applied layer files using normal Git machinery:
+Instead, `git-layers` keeps applied layer files out of the base repo's normal
+view:
 
 - `git status` stays clean for applied layer-only hunks
 - `git diff` does not show applied partial patch hunks
@@ -69,13 +63,8 @@ git layers apply-ref my-layer-branch --name local
 git status --short
 ```
 
-`apply-ref` finds the merge base between `HEAD` and the layer ref, asks Git to
-merge the refs with `git merge-tree --write-tree`, then materializes only the
-resulting changed blobs into `.git/layers/refs/<name>`. This avoids internal
-checkout/smudge steps, so repositories with filters such as `git-crypt` do not
-fail just because an encrypted file exists. Changes made on the base branch
-after the split are preserved, while the layer branch changes are subtracted
-from normal `git diff`, `git status`, and `git add`.
+`apply-ref` derives a layer from the changes on that ref, preserving changes
+that already happened on your current base branch.
 
 If the layer ref is a local branch, `git layers commit` commits layer overlay
 changes on top of that branch:
@@ -169,27 +158,22 @@ tests/smoke.sh
 
 Partial patch mode is text-oriented and currently expects UTF-8 files. Edits
 outside layer hunks behave like normal base-repo edits. If someone edits inside
-the same hunk that the layer owns, the clean/smudge filter can report a patch
-conflict instead of guessing.
+the same hunk that the layer owns, `git-layers` can report a patch conflict
+instead of guessing.
 
-Full-file overlay mode still has normal `skip-worktree` limitations: if a
-layered tracked file also needs a real base-repo edit, use partial mode instead
-or unapply the layer first.
+Full-file overlays are exclusive per path. Use partial mode when multiple
+layers or base edits need to touch the same tracked file.
 
 `apply-ref` currently supports added and modified paths. If the layer branch
 deletes a path, the command stops instead of guessing how that deletion should
 interact with local edits.
 
-`apply-ref` requires a Git version with `git merge-tree --write-tree`.
-
 For `apply-ref`, `git layers commit` currently commits overlay/new-file changes
 back to the source branch. Partial tracked-file hunks are validated but not
 inferred as layer edits; edit those directly on the layer branch for now.
 
-For `git-crypt` paths, ref-backed layers use full-file overlay mode instead of
-partial UTF-8 hunks. If an encrypted path changed in the layer ref, the base repo
-must be unlocked so the layer can materialize plaintext into the working tree
-and encrypt it again when committing back to the layer branch.
+For `git-crypt` paths, the base repo must be unlocked if an encrypted file
+changed in the layer ref.
 
 For private secrets, commit the layer repo only to a private remote. This plugin
 keeps secrets out of the base repo; it does not encrypt the layer repo.

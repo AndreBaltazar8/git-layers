@@ -35,6 +35,7 @@ EXCLUDE_END = "# git-layers:{name} end"
 ATTRIBUTES_BEGIN = "# git-layers:{name} attributes begin"
 ATTRIBUTES_END = "# git-layers:{name} attributes end"
 PATCH_CONTEXT_LINES = 3
+STACK_FILTER_DRIVER = "git-layers-stack"
 
 
 class LayerError(Exception):
@@ -380,9 +381,8 @@ def write_attributes_block(root: Path, name: str, paths: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = path.read_text() if path.exists() else ""
     prefix = "" if not existing or existing.endswith("\n") else "\n"
-    driver = filter_driver_name(name)
     block = [ATTRIBUTES_BEGIN.format(name=name)]
-    block.extend(f"{git_attr_escape(rel)} filter={driver}" for rel in sorted(paths))
+    block.extend(f"{git_attr_escape(rel)} filter={STACK_FILTER_DRIVER}" for rel in sorted(paths))
     block.append(ATTRIBUTES_END.format(name=name))
     with path.open("a") as handle:
         handle.write(prefix + "\n".join(block) + "\n")
@@ -396,11 +396,25 @@ def configure_filter(root: Path, name: str, enabled: bool) -> None:
         return
 
     executable = shlex.quote(str(Path(__file__).resolve()))
-    clean = f"{executable} filter clean --name {shlex.quote(name)} --path '%f'"
-    smudge = f"{executable} filter smudge --name {shlex.quote(name)} --path '%f'"
+    clean = f"{executable} filter clean --name {shlex.quote(name)} --path %f"
+    smudge = f"{executable} filter smudge --name {shlex.quote(name)} --path %f"
     run_git(["config", "--local", f"filter.{driver}.clean", clean], root)
     run_git(["config", "--local", f"filter.{driver}.smudge", smudge], root)
     run_git(["config", "--local", f"filter.{driver}.required", "true"], root)
+
+
+def configure_stack_filter(root: Path, enabled: bool) -> None:
+    if not enabled:
+        for key in ("clean", "smudge", "required"):
+            run_git(["config", "--local", "--unset-all", f"filter.{STACK_FILTER_DRIVER}.{key}"], root, check=False)
+        return
+
+    executable = shlex.quote(str(Path(__file__).resolve()))
+    clean = f"{executable} filter clean --path %f"
+    smudge = f"{executable} filter smudge --path %f"
+    run_git(["config", "--local", f"filter.{STACK_FILTER_DRIVER}.clean", clean], root)
+    run_git(["config", "--local", f"filter.{STACK_FILTER_DRIVER}.smudge", smudge], root)
+    run_git(["config", "--local", f"filter.{STACK_FILTER_DRIVER}.required", "true"], root)
 
 
 def path_filter_attr(root: Path, rel: str) -> str | None:
@@ -503,6 +517,16 @@ def applied_layer_names(root: Path) -> list[str]:
     return sorted(names)
 
 
+def ordered_layer_names(root: Path, *, exclude: str | None = None) -> list[str]:
+    ordered: list[tuple[str, str]] = []
+    for name in applied_layer_names(root):
+        if name == exclude:
+            continue
+        manifest = load_manifest(root, name)
+        ordered.append((manifest.get("applied_at", ""), name))
+    return [name for _applied_at, name in sorted(ordered)]
+
+
 def resolve_layer_name(root: Path, name: str | None) -> str:
     names = applied_layer_names(root)
     if name:
@@ -524,6 +548,25 @@ def managed_layer_paths(root: Path) -> dict[str, str]:
         for entry in manifest.get("paths", []):
             managed[entry["path"]] = name
     return managed
+
+
+def managed_layer_entries(root: Path) -> dict[str, list[tuple[str, str]]]:
+    managed: dict[str, list[tuple[str, str]]] = {}
+    for name in applied_layer_names(root):
+        manifest = load_manifest(root, name)
+        for entry in manifest.get("paths", []):
+            managed.setdefault(entry["path"], []).append((name, entry_mode(entry)))
+    return managed
+
+
+def has_any_partial_layers(root: Path, *, exclude: str | None = None) -> bool:
+    for name in applied_layer_names(root):
+        if name == exclude:
+            continue
+        manifest = load_manifest(root, name)
+        if manifest.get("filter_paths"):
+            return True
+    return False
 
 
 def create_manifest(root: Path, name: str, layer: Path, entries: list[dict[str, Any]]) -> dict[str, Any]:
@@ -554,7 +597,7 @@ def install_layer_integration(root: Path, name: str, manifest: dict[str, Any]) -
     refresh_manifest_paths(manifest)
     write_exclude_block(root, name, manifest["exclude_paths"])
     write_attributes_block(root, name, manifest["filter_paths"])
-    configure_filter(root, name, bool(manifest["filter_paths"]))
+    configure_stack_filter(root, has_any_partial_layers(root))
     set_skip_worktree(root, manifest["skip_worktree_paths"], True)
     refresh_index(root, manifest["filter_paths"])
 
@@ -564,6 +607,7 @@ def uninstall_layer_integration(root: Path, name: str, manifest: dict[str, Any])
     remove_exclude_block(root, name)
     remove_attributes_block(root, name)
     configure_filter(root, name, False)
+    configure_stack_filter(root, has_any_partial_layers(root, exclude=name))
 
 
 def ensure_layer_git_repo(layer: Path, *, init: bool) -> None:
@@ -792,12 +836,10 @@ def apply_layer(
         raise LayerError(f"layer has no files: {layer}")
 
     tracked_paths = get_tracked_paths(root)
-    managed_paths = managed_layer_paths(root)
+    managed_paths = managed_layer_entries(root)
     entries: list[dict[str, Any]] = []
 
     for rel, source in layer_files:
-        if rel in managed_paths:
-            raise LayerError(f"{rel} is already managed by layer {managed_paths[rel]}")
         target = root / rel
         if not inside_root(target, root):
             raise LayerError(f"refusing to apply path outside repository: {rel}")
@@ -825,6 +867,11 @@ def apply_layer(
                     "hunks": build_line_hunks(base, layer_content, rel),
                 }
             )
+        existing_modes = managed_paths.get(rel, [])
+        if existing_modes:
+            existing = ", ".join(f"{layer_name}:{mode}" for layer_name, mode in existing_modes)
+            if entry_mode(entry) != "partial" or any(mode != "partial" for _layer_name, mode in existing_modes):
+                raise LayerError(f"{rel} is already managed by layer(s) {existing}")
         entries.append(entry)
 
     state_dir = state_root(root) / name
@@ -838,7 +885,10 @@ def apply_layer(
             target = root / rel
             if entry["existed"]:
                 copy_path(target, backup_dir / rel)
-            copy_path(source, target)
+            if entry_mode(entry) == "partial":
+                write_bytes(target, transform_with_hunks(read_bytes_or_empty(target), entry.get("hunks", []), "smudge", rel))
+            else:
+                copy_path(source, target)
             entry["applied_sha256"] = sha256_file(target)
 
         manifest = create_manifest(root, name, layer, entries)
@@ -1346,13 +1396,27 @@ def command_diff(args: argparse.Namespace) -> int:
 
 def command_filter(args: argparse.Namespace) -> int:
     root = repo_root()
-    manifest = load_manifest(root, args.name)
-    entry = find_manifest_entry(manifest, args.path)
     content = sys.stdin.buffer.read()
-    if entry is None or entry_mode(entry) != "partial":
-        sys.stdout.buffer.write(content)
+
+    if args.name:
+        manifest = load_manifest(root, args.name)
+        entry = find_manifest_entry(manifest, args.path)
+        if entry is None or entry_mode(entry) != "partial":
+            sys.stdout.buffer.write(content)
+            return 0
+        transformed = transform_with_hunks(content, entry.get("hunks", []), args.direction, entry["path"])
+        sys.stdout.buffer.write(transformed)
         return 0
-    transformed = transform_with_hunks(content, entry.get("hunks", []), args.direction, entry["path"])
+
+    transformed = content
+    names = ordered_layer_names(root)
+    if args.direction == "clean":
+        names = list(reversed(names))
+    for name in names:
+        manifest = load_manifest(root, name)
+        entry = find_manifest_entry(manifest, args.path)
+        if entry is not None and entry_mode(entry) == "partial":
+            transformed = transform_with_hunks(transformed, entry.get("hunks", []), args.direction, entry["path"])
     sys.stdout.buffer.write(transformed)
     return 0
 
@@ -1439,7 +1503,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     filter_parser = sub.add_parser("filter", help="internal clean/smudge filter driver")
     filter_parser.add_argument("direction", choices=("clean", "smudge"))
-    filter_parser.add_argument("--name", required=True)
+    filter_parser.add_argument("--name")
     filter_parser.add_argument("--path", required=True)
     filter_parser.set_defaults(func=command_filter)
 

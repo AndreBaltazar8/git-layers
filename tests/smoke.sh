@@ -96,6 +96,71 @@ grep -q 'base alpha' notes.txt
 ! grep -q 'layer charlie' notes.txt
 grep -q 'user delta' notes.txt
 
+tmp_stack="$tmp/ref-stack"
+mkdir "$tmp_stack"
+cd "$tmp_stack"
+git init -q --initial-branch=main
+git config user.email layers@example.local
+git config user.name "Git Layers Test"
+printf 'one\ntwo\nthree\nfour\nfive\n' > f.txt
+git add f.txt
+git commit -m "base" >/dev/null
+
+git checkout -q -b layer/top
+perl -0pi -e 's/one/layer one/' f.txt
+git commit -am "layer top" >/dev/null
+
+git checkout -q main
+git checkout -q -b layer/bottom
+perl -0pi -e 's/five/layer five/' f.txt
+git commit -am "layer bottom" >/dev/null
+
+git checkout -q main
+git layers apply-ref layer/top --name top >/dev/null
+git layers apply-ref layer/bottom --name bottom >/dev/null
+test -z "$(git status --short)"
+grep -q 'layer one' f.txt
+grep -q 'layer five' f.txt
+
+printf 'user edit\n' >> f.txt
+git diff -- f.txt | grep -q '+user edit'
+! git diff -- f.txt | grep -q 'layer one'
+! git diff -- f.txt | grep -q 'layer five'
+
+git layers unapply top >/dev/null
+! grep -q 'layer one' f.txt
+grep -q 'layer five' f.txt
+grep -q 'user edit' f.txt
+
+git layers unapply bottom >/dev/null
+! grep -q 'layer one' f.txt
+! grep -q 'layer five' f.txt
+grep -q 'user edit' f.txt
+git diff -- f.txt | grep -q '+user edit'
+
+tmp_special="$tmp/special-paths"
+mkdir "$tmp_special"
+cd "$tmp_special"
+git init -q --initial-branch=main
+git config user.email layers@example.local
+git config user.name "Git Layers Test"
+mkdir -p 'src/(auth)'
+printf 'base\n' > 'src/(auth)/[gameId].txt'
+git add .
+git commit -m "base" >/dev/null
+
+git checkout -q -b layer/special
+printf 'layer\n' > 'src/(auth)/[gameId].txt'
+git commit -am "layer special path" >/dev/null
+
+git checkout -q main
+git layers apply-ref layer/special --name special >/dev/null
+test -z "$(git status --short)"
+test -z "$(git diff -- 'src/(auth)/[gameId].txt')"
+printf 'user\n' >> 'src/(auth)/[gameId].txt'
+git diff -- 'src/(auth)/[gameId].txt' | grep -q '+user'
+! git diff -- 'src/(auth)/[gameId].txt' | grep -q 'layer'
+
 if command -v git-crypt >/dev/null 2>&1; then
   tmp_crypt="$tmp/git-crypt-layer"
   mkdir "$tmp_crypt"
