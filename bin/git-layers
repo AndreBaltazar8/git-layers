@@ -1,0 +1,1115 @@
+#!/usr/bin/env python3
+"""
+git-layers: local patch layers for a Git worktree.
+
+Install by putting this repository's bin directory on PATH, then run:
+
+    git layers apply ../my-layer --name local
+
+Git discovers executables named git-<command> on PATH, so this script becomes
+available as `git layers`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+
+TOOL_NAME = "git-layers"
+STATE_VERSION = 1
+EXCLUDE_BEGIN = "# git-layers:{name} begin"
+EXCLUDE_END = "# git-layers:{name} end"
+ATTRIBUTES_BEGIN = "# git-layers:{name} attributes begin"
+ATTRIBUTES_END = "# git-layers:{name} attributes end"
+PATCH_CONTEXT_LINES = 3
+
+
+class LayerError(Exception):
+    pass
+
+
+def die(message: str, exit_code: int = 1) -> None:
+    print(f"{TOOL_NAME}: {message}", file=sys.stderr)
+    raise SystemExit(exit_code)
+
+
+def run_git(
+    args: list[str],
+    cwd: Path,
+    *,
+    check: bool = True,
+    stdin: bytes | None = None,
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        input=stdin,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise LayerError(f"git {' '.join(args)} failed: {detail}")
+    return result
+
+
+def repo_root() -> Path:
+    try:
+        result = run_git(["rev-parse", "--show-toplevel"], Path.cwd())
+    except LayerError as exc:
+        raise LayerError("run this command from inside a Git worktree") from exc
+    return Path(result.stdout.strip()).resolve()
+
+
+def git_dir(root: Path) -> Path:
+    try:
+        result = run_git(["rev-parse", "--absolute-git-dir"], root)
+    except LayerError:
+        result = run_git(["rev-parse", "--git-dir"], root)
+        path = Path(result.stdout.strip())
+        if not path.is_absolute():
+            path = root / path
+        return path.resolve()
+    return Path(result.stdout.strip()).resolve()
+
+
+def layers_dir(root: Path) -> Path:
+    return git_dir(root) / "layers"
+
+
+def state_root(root: Path) -> Path:
+    return layers_dir(root) / "state"
+
+
+def manifest_path(root: Path, name: str) -> Path:
+    return state_root(root) / name / "manifest.json"
+
+
+def backup_root(root: Path, name: str) -> Path:
+    return state_root(root) / name / "backup"
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def sanitize_name(name: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", name.strip())
+    sanitized = sanitized.strip(".-")
+    if not sanitized:
+        raise LayerError("layer name must contain at least one letter, number, '.', '_' or '-'")
+    return sanitized
+
+
+def rel_posix(path: Path, root: Path) -> str:
+    return path.relative_to(root).as_posix()
+
+
+def inside_root(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def sha256_file(path: Path) -> str | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    digest = hashlib.sha256()
+    if path.is_symlink():
+        digest.update(b"symlink:")
+        digest.update(os.readlink(path).encode())
+        return digest.hexdigest()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def read_bytes_or_empty(path: Path) -> bytes:
+    if not path.exists() and not path.is_symlink():
+        return b""
+    if path.is_symlink():
+        return os.readlink(path).encode()
+    return path.read_bytes()
+
+
+def write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+
+
+def copy_path(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() or dst.is_symlink():
+        if dst.is_dir() and not dst.is_symlink():
+            shutil.rmtree(dst)
+        else:
+            dst.unlink()
+    if src.is_symlink():
+        os.symlink(os.readlink(src), dst)
+    else:
+        shutil.copy2(src, dst)
+
+
+def remove_empty_parents(path: Path, stop: Path) -> None:
+    current = path.parent
+    while current != stop and inside_root(current, stop):
+        try:
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
+
+
+def iter_worktree_files(root: Path, path: Path) -> Iterable[tuple[str, Path]]:
+    path = path.resolve()
+    if not inside_root(path, root):
+        raise LayerError(f"refusing to track path outside repository: {path}")
+    if path.is_dir() and not path.is_symlink():
+        for dirpath, dirnames, filenames in os.walk(path):
+            dirnames[:] = [name for name in dirnames if name != ".git"]
+            for filename in filenames:
+                source = Path(dirpath) / filename
+                yield rel_posix(source, root), source
+        return
+    if not path.exists() and not path.is_symlink():
+        raise LayerError(f"path does not exist: {rel_posix(path, root)}")
+    yield rel_posix(path, root), path
+
+
+def iter_layer_files(layer: Path) -> Iterable[tuple[str, Path]]:
+    layer = layer.resolve()
+    if not layer.is_dir():
+        raise LayerError(f"layer path is not a directory: {layer}")
+    for dirpath, dirnames, filenames in os.walk(layer):
+        dirnames[:] = [name for name in dirnames if name != ".git"]
+        for filename in filenames:
+            source = Path(dirpath) / filename
+            rel = source.relative_to(layer).as_posix()
+            if rel == ".git" or rel.startswith(".git/"):
+                continue
+            yield rel, source
+
+
+def get_tracked_paths(root: Path) -> set[str]:
+    result = run_git(["ls-files", "-z"], root)
+    if not result.stdout:
+        return set()
+    return {item for item in result.stdout.split("\0") if item}
+
+
+def status_for_path(root: Path, rel: str) -> str:
+    result = run_git(["status", "--porcelain=v1", "--", rel], root)
+    return result.stdout.strip()
+
+
+def has_staged_changes(root: Path, rel: str) -> bool:
+    result = run_git(["diff", "--cached", "--quiet", "--", rel], root, check=False)
+    return result.returncode != 0
+
+
+def require_clean_target(root: Path, rel: str, tracked: bool, force: bool) -> None:
+    target = root / rel
+    porcelain = status_for_path(root, rel)
+    if tracked:
+        if porcelain and not force:
+            raise LayerError(
+                f"{rel} has pending Git changes; commit, stash, or pass --force before applying a layer"
+            )
+        return
+    if (target.exists() or target.is_symlink()) and not force:
+        raise LayerError(
+            f"{rel} already exists and is not tracked by Git; move it, remove it, or pass --force"
+        )
+
+
+def gitignore_escape(rel: str) -> str:
+    escaped = []
+    for char in rel:
+        if char in "\\*?[":
+            escaped.append("\\" + char)
+        else:
+            escaped.append(char)
+    return "/" + "".join(escaped)
+
+
+def exclude_file(root: Path) -> Path:
+    return git_dir(root) / "info" / "exclude"
+
+
+def remove_exclude_block(root: Path, name: str) -> None:
+    path = exclude_file(root)
+    if not path.exists():
+        return
+    begin = EXCLUDE_BEGIN.format(name=name)
+    end = EXCLUDE_END.format(name=name)
+    lines = path.read_text().splitlines()
+    output: list[str] = []
+    skipping = False
+    changed = False
+    for line in lines:
+        if line == begin:
+            skipping = True
+            changed = True
+            continue
+        if skipping and line == end:
+            skipping = False
+            continue
+        if not skipping:
+            output.append(line)
+    if changed:
+        path.write_text("\n".join(output).rstrip() + ("\n" if output else ""))
+
+
+def write_exclude_block(root: Path, name: str, paths: list[str]) -> None:
+    remove_exclude_block(root, name)
+    if not paths:
+        return
+    path = exclude_file(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text() if path.exists() else ""
+    prefix = "" if not existing or existing.endswith("\n") else "\n"
+    block = [EXCLUDE_BEGIN.format(name=name)]
+    block.extend(gitignore_escape(rel) for rel in sorted(paths))
+    block.append(EXCLUDE_END.format(name=name))
+    with path.open("a") as handle:
+        handle.write(prefix + "\n".join(block) + "\n")
+
+
+def attributes_file(root: Path) -> Path:
+    return git_dir(root) / "info" / "attributes"
+
+
+def git_attr_escape(rel: str) -> str:
+    escaped = []
+    for char in rel:
+        if char in "\\*?[# \t":
+            escaped.append("\\" + char)
+        else:
+            escaped.append(char)
+    return "/" + "".join(escaped)
+
+
+def filter_driver_name(name: str) -> str:
+    return f"git-layers-{name}"
+
+
+def remove_attributes_block(root: Path, name: str) -> None:
+    path = attributes_file(root)
+    if not path.exists():
+        return
+    begin = ATTRIBUTES_BEGIN.format(name=name)
+    end = ATTRIBUTES_END.format(name=name)
+    lines = path.read_text().splitlines()
+    output: list[str] = []
+    skipping = False
+    changed = False
+    for line in lines:
+        if line == begin:
+            skipping = True
+            changed = True
+            continue
+        if skipping and line == end:
+            skipping = False
+            continue
+        if not skipping:
+            output.append(line)
+    if changed:
+        path.write_text("\n".join(output).rstrip() + ("\n" if output else ""))
+
+
+def write_attributes_block(root: Path, name: str, paths: list[str]) -> None:
+    remove_attributes_block(root, name)
+    if not paths:
+        return
+    path = attributes_file(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text() if path.exists() else ""
+    prefix = "" if not existing or existing.endswith("\n") else "\n"
+    driver = filter_driver_name(name)
+    block = [ATTRIBUTES_BEGIN.format(name=name)]
+    block.extend(f"{git_attr_escape(rel)} filter={driver}" for rel in sorted(paths))
+    block.append(ATTRIBUTES_END.format(name=name))
+    with path.open("a") as handle:
+        handle.write(prefix + "\n".join(block) + "\n")
+
+
+def configure_filter(root: Path, name: str, enabled: bool) -> None:
+    driver = filter_driver_name(name)
+    if not enabled:
+        for key in ("clean", "smudge", "required"):
+            run_git(["config", "--local", "--unset-all", f"filter.{driver}.{key}"], root, check=False)
+        return
+
+    executable = shlex.quote(str(Path(__file__).resolve()))
+    clean = f"{executable} filter clean --name {shlex.quote(name)} --path '%f'"
+    smudge = f"{executable} filter smudge --name {shlex.quote(name)} --path '%f'"
+    run_git(["config", "--local", f"filter.{driver}.clean", clean], root)
+    run_git(["config", "--local", f"filter.{driver}.smudge", smudge], root)
+    run_git(["config", "--local", f"filter.{driver}.required", "true"], root)
+
+
+def refresh_index(root: Path, paths: list[str]) -> None:
+    if paths:
+        run_git(["update-index", "--refresh", "--", *paths], root, check=False)
+
+
+def index_blob_hash(root: Path, rel: str) -> str | None:
+    result = run_git(["rev-parse", f":{rel}"], root, check=False)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def worktree_blob_hash(root: Path, rel: str) -> str | None:
+    if not (root / rel).exists():
+        return None
+    result = run_git(["hash-object", "--", rel], root, check=False)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def refresh_index_if_unchanged(root: Path, paths: list[str]) -> None:
+    unchanged = [rel for rel in paths if index_blob_hash(root, rel) == worktree_blob_hash(root, rel)]
+    refresh_index(root, unchanged)
+
+
+def set_skip_worktree(root: Path, paths: list[str], enabled: bool) -> None:
+    if not paths:
+        return
+    flag = "--skip-worktree" if enabled else "--no-skip-worktree"
+    run_git(["update-index", flag, "--", *paths], root)
+
+
+def load_manifest(root: Path, name: str) -> dict[str, Any]:
+    path = manifest_path(root, name)
+    if not path.exists():
+        raise LayerError(f"layer is not applied: {name}")
+    return json.loads(path.read_text())
+
+
+def save_manifest(root: Path, name: str, manifest: dict[str, Any]) -> None:
+    path = manifest_path(root, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+
+def applied_layer_names(root: Path) -> list[str]:
+    directory = state_root(root)
+    if not directory.exists():
+        return []
+    names = []
+    for child in directory.iterdir():
+        if child.is_dir() and (child / "manifest.json").exists():
+            names.append(child.name)
+    return sorted(names)
+
+
+def resolve_layer_name(root: Path, name: str | None) -> str:
+    names = applied_layer_names(root)
+    if name:
+        name = sanitize_name(name)
+        if name not in names:
+            raise LayerError(f"layer is not applied: {name}")
+        return name
+    if not names:
+        raise LayerError("no layers are currently applied")
+    if len(names) > 1:
+        raise LayerError(f"choose a layer name: {', '.join(names)}")
+    return names[0]
+
+
+def managed_layer_paths(root: Path) -> dict[str, str]:
+    managed: dict[str, str] = {}
+    for name in applied_layer_names(root):
+        manifest = load_manifest(root, name)
+        for entry in manifest.get("paths", []):
+            managed[entry["path"]] = name
+    return managed
+
+
+def create_manifest(root: Path, name: str, layer: Path, entries: list[dict[str, Any]]) -> dict[str, Any]:
+    manifest = {
+        "version": STATE_VERSION,
+        "name": name,
+        "layer_dir": str(layer),
+        "repo_root": str(root),
+        "applied_at": now_iso(),
+        "paths": entries,
+    }
+    refresh_manifest_paths(manifest)
+    return manifest
+
+
+def refresh_manifest_paths(manifest: dict[str, Any]) -> None:
+    paths = manifest.get("paths", [])
+    manifest["skip_worktree_paths"] = sorted(
+        entry["path"] for entry in paths if entry.get("tracked") and entry_mode(entry) == "overlay"
+    )
+    manifest["exclude_paths"] = sorted(
+        entry["path"] for entry in paths if not entry.get("tracked") and entry_mode(entry) == "overlay"
+    )
+    manifest["filter_paths"] = sorted(entry["path"] for entry in paths if entry_mode(entry) == "partial")
+
+
+def install_layer_integration(root: Path, name: str, manifest: dict[str, Any]) -> None:
+    refresh_manifest_paths(manifest)
+    write_exclude_block(root, name, manifest["exclude_paths"])
+    write_attributes_block(root, name, manifest["filter_paths"])
+    configure_filter(root, name, bool(manifest["filter_paths"]))
+    set_skip_worktree(root, manifest["skip_worktree_paths"], True)
+    refresh_index(root, manifest["filter_paths"])
+
+
+def uninstall_layer_integration(root: Path, name: str, manifest: dict[str, Any]) -> None:
+    set_skip_worktree(root, manifest.get("skip_worktree_paths", []), False)
+    remove_exclude_block(root, name)
+    remove_attributes_block(root, name)
+    configure_filter(root, name, False)
+
+
+def ensure_layer_git_repo(layer: Path, *, init: bool) -> None:
+    if not layer.exists():
+        if not init:
+            raise LayerError(f"layer directory does not exist: {layer}")
+        layer.mkdir(parents=True)
+    result = run_git(["rev-parse", "--is-inside-work-tree"], layer, check=False)
+    if result.returncode == 0 and result.stdout.strip() == "true":
+        return
+    if not init:
+        raise LayerError(f"layer is not a Git repository: {layer}")
+    run_git(["init"], layer)
+
+
+def write_head_backup(root: Path, rel: str, destination: Path) -> None:
+    base = git_show_path(root, rel)
+    if base is None:
+        raise LayerError(f"cannot read HEAD version for tracked path: {rel}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(base)
+
+
+def split_utf8_lines(content: bytes, rel: str) -> list[str]:
+    try:
+        return content.decode("utf-8").splitlines(keepends=True)
+    except UnicodeDecodeError as exc:
+        raise LayerError(f"partial patch filters only support UTF-8 text files: {rel}") from exc
+
+
+def join_utf8_lines(lines: list[str]) -> bytes:
+    return "".join(lines).encode("utf-8")
+
+
+def build_line_hunks(base: bytes, layer: bytes, rel: str) -> list[dict[str, Any]]:
+    base_lines = split_utf8_lines(base, rel)
+    layer_lines = split_utf8_lines(layer, rel)
+    matcher = difflib.SequenceMatcher(a=base_lines, b=layer_lines)
+    hunks: list[dict[str, Any]] = []
+    for group in matcher.get_grouped_opcodes(PATCH_CONTEXT_LINES):
+        old_start = group[0][1]
+        old_end = group[-1][2]
+        new_start = group[0][3]
+        new_end = group[-1][4]
+        old_lines = base_lines[old_start:old_end]
+        new_lines = layer_lines[new_start:new_end]
+        if old_lines == new_lines:
+            continue
+        hunks.append(
+            {
+                "old_start": old_start,
+                "new_start": new_start,
+                "old_lines": old_lines,
+                "new_lines": new_lines,
+            }
+        )
+    return hunks
+
+
+def find_sequence(lines: list[str], needle: list[str]) -> list[int]:
+    if not needle:
+        return [0] if not lines else []
+    size = len(needle)
+    if size > len(lines):
+        return []
+    return [index for index in range(0, len(lines) - size + 1) if lines[index : index + size] == needle]
+
+
+def nearest_index(matches: list[int], expected: int) -> int:
+    return min(matches, key=lambda index: abs(index - expected))
+
+
+def transform_with_hunks(content: bytes, hunks: list[dict[str, Any]], direction: str, rel: str) -> bytes:
+    lines = split_utf8_lines(content, rel)
+    offset = 0
+    for hunk in hunks:
+        if direction == "smudge":
+            source = hunk["old_lines"]
+            replacement = hunk["new_lines"]
+            expected = hunk["old_start"] + offset
+        else:
+            source = hunk["new_lines"]
+            replacement = hunk["old_lines"]
+            expected = hunk["new_start"] + offset
+
+        if source == replacement:
+            continue
+
+        if not source:
+            if lines:
+                raise LayerError(f"partial patch for {rel} no longer applies cleanly")
+            index = 0
+        else:
+            matches = find_sequence(lines, source)
+            if not matches:
+                if find_sequence(lines, replacement):
+                    continue
+                raise LayerError(f"partial patch for {rel} no longer applies cleanly")
+            index = nearest_index(matches, expected)
+
+        lines[index : index + len(source)] = replacement
+        offset += len(replacement) - len(source)
+    return join_utf8_lines(lines)
+
+
+def entry_mode(entry: dict[str, Any]) -> str:
+    return entry.get("mode", "overlay")
+
+
+def partial_paths(manifest: dict[str, Any]) -> list[str]:
+    return sorted(entry["path"] for entry in manifest.get("paths", []) if entry_mode(entry) == "partial")
+
+
+def overlay_skip_paths(manifest: dict[str, Any]) -> list[str]:
+    return sorted(
+        entry["path"]
+        for entry in manifest.get("paths", [])
+        if entry.get("tracked") and entry_mode(entry) == "overlay"
+    )
+
+
+def overlay_exclude_paths(manifest: dict[str, Any]) -> list[str]:
+    return sorted(
+        entry["path"]
+        for entry in manifest.get("paths", [])
+        if not entry.get("tracked") and entry_mode(entry) == "overlay"
+    )
+
+
+def find_manifest_entry(manifest: dict[str, Any], rel: str) -> dict[str, Any] | None:
+    normalized = Path(rel).as_posix()
+    for entry in manifest.get("paths", []):
+        if entry["path"] == normalized:
+            return entry
+    return None
+
+
+def command_apply(args: argparse.Namespace) -> int:
+    root = repo_root()
+    layer = Path(args.layer).expanduser().resolve()
+    name = sanitize_name(args.name or layer.name)
+    if manifest_path(root, name).exists():
+        raise LayerError(f"layer is already applied: {name}")
+
+    layer_files = list(iter_layer_files(layer))
+    if not layer_files and not args.allow_empty:
+        raise LayerError(f"layer has no files: {layer}")
+
+    tracked_paths = get_tracked_paths(root)
+    managed_paths = managed_layer_paths(root)
+    entries: list[dict[str, Any]] = []
+
+    for rel, source in layer_files:
+        if rel in managed_paths:
+            raise LayerError(f"{rel} is already managed by layer {managed_paths[rel]}")
+        target = root / rel
+        if not inside_root(target, root):
+            raise LayerError(f"refusing to apply path outside repository: {rel}")
+        if target.exists() and target.is_dir() and not target.is_symlink():
+            raise LayerError(f"refusing to replace directory with file: {rel}")
+        tracked = rel in tracked_paths
+        require_clean_target(root, rel, tracked, args.force)
+        entry: dict[str, Any] = {
+            "path": rel,
+            "tracked": tracked,
+            "existed": target.exists() or target.is_symlink(),
+            "source_sha256": sha256_file(source),
+            "applied_sha256": None,
+            "mode": "overlay",
+        }
+        if tracked and args.partial:
+            base = git_show_path(root, rel)
+            if base is None:
+                raise LayerError(f"cannot build partial patch for missing HEAD path: {rel}")
+            layer_content = read_bytes_or_empty(source)
+            entry.update(
+                {
+                    "mode": "partial",
+                    "base_sha256": hashlib.sha256(base).hexdigest(),
+                    "hunks": build_line_hunks(base, layer_content, rel),
+                }
+            )
+        entries.append(entry)
+
+    state_dir = state_root(root) / name
+    state_dir.mkdir(parents=True, exist_ok=False)
+    backup_dir = backup_root(root, name)
+    manifest: dict[str, Any] | None = None
+    try:
+        for entry in entries:
+            rel = entry["path"]
+            source = layer / rel
+            target = root / rel
+            if entry["existed"]:
+                copy_path(target, backup_dir / rel)
+            copy_path(source, target)
+            entry["applied_sha256"] = sha256_file(target)
+
+        manifest = create_manifest(root, name, layer, entries)
+        save_manifest(root, name, manifest)
+        install_layer_integration(root, name, manifest)
+    except Exception:
+        if manifest is not None:
+            uninstall_layer_integration(root, name, manifest)
+        else:
+            remove_exclude_block(root, name)
+            remove_attributes_block(root, name)
+            configure_filter(root, name, False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+        raise
+
+    print(f"applied layer {name} from {layer}")
+    print(f"partial tracked paths subtracted with filters: {len(manifest['filter_paths'])}")
+    print(f"tracked overlay paths hidden with skip-worktree: {len(manifest['skip_worktree_paths'])}")
+    print(f"untracked overlay paths hidden with .git/info/exclude: {len(manifest['exclude_paths'])}")
+    return 0
+
+
+def command_init(args: argparse.Namespace) -> int:
+    layer = Path(args.layer).expanduser().resolve()
+    ensure_layer_git_repo(layer, init=True)
+    print(f"initialized layer repo at {layer}")
+
+    if not args.apply:
+        return 0
+
+    root = repo_root()
+    name = sanitize_name(args.name or layer.name)
+    if manifest_path(root, name).exists():
+        raise LayerError(f"layer is already applied: {name}")
+    state_dir = state_root(root) / name
+    state_dir.mkdir(parents=True, exist_ok=False)
+    manifest = create_manifest(root, name, layer, [])
+    save_manifest(root, name, manifest)
+    print(f"applied empty layer {name}")
+    return 0
+
+
+def command_unapply(args: argparse.Namespace) -> int:
+    root = repo_root()
+    name = resolve_layer_name(root, args.name)
+    manifest = load_manifest(root, name)
+    paths = manifest["paths"]
+
+    dirty: list[str] = []
+    for entry in paths:
+        if entry_mode(entry) == "partial":
+            continue
+        rel = entry["path"]
+        target = root / rel
+        current = sha256_file(target)
+        if current != entry.get("applied_sha256"):
+            dirty.append(rel)
+    if dirty and not args.force:
+        raise LayerError(
+            "layer files changed since apply; run `git layers save "
+            f"{name}` first or pass --force: {', '.join(dirty)}"
+        )
+
+    for entry in paths:
+        rel = entry["path"]
+        target = root / rel
+        if entry_mode(entry) == "partial":
+            try:
+                clean_content = transform_with_hunks(read_bytes_or_empty(target), entry.get("hunks", []), "clean", rel)
+            except LayerError:
+                if not args.force:
+                    raise
+                base = git_show_path(root, rel)
+                clean_content = base or b""
+            write_bytes(target, clean_content)
+        elif entry["existed"]:
+            copy_path(backup_root(root, name) / rel, target)
+        else:
+            if target.exists() or target.is_symlink():
+                target.unlink()
+            remove_empty_parents(target, root)
+
+    uninstall_layer_integration(root, name, manifest)
+    refresh_index_if_unchanged(root, sorted(entry["path"] for entry in paths if entry.get("tracked")))
+    shutil.rmtree(state_root(root) / name)
+    print(f"unapplied layer {name}")
+    return 0
+
+
+def entry_state(root: Path, manifest: dict[str, Any], entry: dict[str, Any]) -> str:
+    rel = entry["path"]
+    target = root / rel
+    layer_path = Path(manifest["layer_dir"]) / rel
+    current_hash = sha256_file(target)
+    layer_hash = sha256_file(layer_path)
+    if entry_mode(entry) == "partial":
+        if current_hash is None:
+            return "missing from worktree"
+        try:
+            clean_content = transform_with_hunks(read_bytes_or_empty(target), entry.get("hunks", []), "clean", rel)
+            smudged = transform_with_hunks(clean_content, entry.get("hunks", []), "smudge", rel)
+        except LayerError:
+            return "partial patch conflict"
+        return "clean" if hashlib.sha256(smudged).hexdigest() == current_hash else "worktree changed"
+    if current_hash is None:
+        return "missing from worktree"
+    if layer_hash is None:
+        return "missing from layer source"
+    if current_hash == layer_hash:
+        return "clean"
+    if current_hash == entry.get("applied_sha256"):
+        return "layer source changed"
+    return "worktree changed"
+
+
+def command_status(args: argparse.Namespace) -> int:
+    root = repo_root()
+    names = applied_layer_names(root)
+    if not names:
+        print("no layers applied")
+    for name in names:
+        manifest = load_manifest(root, name)
+        print(f"{name}: {manifest['layer_dir']}")
+        for entry in manifest["paths"]:
+            marker = "tracked" if entry["tracked"] else "untracked"
+            print(f"  {entry['path']} [{marker}] - {entry_state(root, manifest, entry)}")
+
+    result = run_git(["status", "--short"], root)
+    print("\ngit status after subtracting applied layers:")
+    print(result.stdout.rstrip() or "  clean")
+    return 0
+
+
+def command_list(args: argparse.Namespace) -> int:
+    root = repo_root()
+    names = applied_layer_names(root)
+    if not names:
+        print("no layers applied")
+        return 0
+    for name in names:
+        manifest = load_manifest(root, name)
+        print(f"{name}\t{manifest['layer_dir']}")
+    return 0
+
+
+def command_save(args: argparse.Namespace) -> int:
+    root = repo_root()
+    name = resolve_layer_name(root, args.name)
+    manifest = load_manifest(root, name)
+    changed = save_layer(root, name, manifest)
+    print(f"saved {changed} changed path(s) back to layer {name}")
+    return 0
+
+
+def save_layer(root: Path, name: str, manifest: dict[str, Any]) -> int:
+    layer = Path(manifest["layer_dir"])
+    if not layer.is_dir():
+        raise LayerError(f"layer source directory is missing: {layer}")
+
+    changed = 0
+    for entry in manifest["paths"]:
+        rel = entry["path"]
+        target = root / rel
+        destination = layer / rel
+        before = sha256_file(destination)
+        if entry_mode(entry) == "partial":
+            base = git_show_path(root, rel)
+            if base is None:
+                raise LayerError(f"cannot save partial layer for missing HEAD path: {rel}")
+            write_bytes(destination, transform_with_hunks(base, entry.get("hunks", []), "smudge", rel))
+        else:
+            if not target.exists() and not target.is_symlink():
+                raise LayerError(f"cannot save missing worktree path: {rel}")
+            copy_path(target, destination)
+        after = sha256_file(destination)
+        entry["source_sha256"] = after
+        entry["applied_sha256"] = sha256_file(target)
+        if before != after:
+            changed += 1
+
+    manifest["saved_at"] = now_iso()
+    save_manifest(root, name, manifest)
+    return changed
+
+
+def command_track(args: argparse.Namespace) -> int:
+    root = repo_root()
+    name = resolve_layer_name(root, args.layer)
+    manifest = load_manifest(root, name)
+    layer = Path(manifest["layer_dir"])
+    if not layer.is_dir():
+        raise LayerError(f"layer source directory is missing: {layer}")
+
+    existing_paths = {entry["path"] for entry in manifest["paths"]}
+    managed_paths = managed_layer_paths(root)
+    tracked_paths = get_tracked_paths(root)
+    added_entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for raw_path in args.paths:
+        for rel, source in iter_worktree_files(root, root / raw_path):
+            if rel in seen:
+                continue
+            seen.add(rel)
+            if rel in existing_paths:
+                raise LayerError(f"path is already tracked by layer {name}: {rel}")
+            if rel in managed_paths:
+                raise LayerError(f"path is already managed by layer {managed_paths[rel]}: {rel}")
+            if source.is_dir() and not source.is_symlink():
+                raise LayerError(f"cannot track directory as a file: {rel}")
+            tracked = rel in tracked_paths
+            if tracked and has_staged_changes(root, rel) and not args.force:
+                raise LayerError(f"{rel} has staged changes; unstage it or pass --force")
+            mode = args.mode
+            if mode == "auto":
+                mode = "partial" if tracked else "overlay"
+            if mode == "partial" and not tracked:
+                raise LayerError(f"partial layer paths must already be tracked by the base repo: {rel}")
+            destination = layer / rel
+            before = sha256_file(source)
+            copy_path(source, destination)
+            entry = {
+                "path": rel,
+                "tracked": tracked,
+                "existed": tracked,
+                "source_sha256": sha256_file(destination),
+                "applied_sha256": before,
+                "mode": mode,
+            }
+            if mode == "partial":
+                base = git_show_path(root, rel)
+                if base is None:
+                    raise LayerError(f"cannot build partial patch for missing HEAD path: {rel}")
+                entry["base_sha256"] = hashlib.sha256(base).hexdigest()
+                entry["hunks"] = build_line_hunks(base, read_bytes_or_empty(source), rel)
+            elif tracked:
+                write_head_backup(root, rel, backup_root(root, name) / rel)
+            added_entries.append(entry)
+
+    if not added_entries:
+        raise LayerError("no files matched")
+
+    manifest["paths"].extend(added_entries)
+    manifest["paths"] = sorted(manifest["paths"], key=lambda entry: entry["path"])
+    refresh_manifest_paths(manifest)
+    manifest["tracked_at"] = now_iso()
+    save_manifest(root, name, manifest)
+    install_layer_integration(root, name, manifest)
+
+    print(f"tracked {len(added_entries)} path(s) in layer {name}")
+    return 0
+
+
+def command_commit(args: argparse.Namespace) -> int:
+    root = repo_root()
+    name = resolve_layer_name(root, args.name)
+    manifest = load_manifest(root, name)
+    layer = Path(manifest["layer_dir"])
+    ensure_layer_git_repo(layer, init=args.init)
+
+    changed = save_layer(root, name, manifest)
+    paths = [entry["path"] for entry in manifest["paths"]]
+    if paths:
+        run_git(["add", "--", *paths], layer)
+    status = run_git(["status", "--porcelain=v1"], layer).stdout.strip()
+    if not status and not args.allow_empty:
+        print(f"nothing to commit in layer {name}")
+        return 0
+
+    commit_args = ["commit"]
+    if args.allow_empty:
+        commit_args.append("--allow-empty")
+    commit_args.extend(["-m", args.message])
+    run_git(commit_args, layer)
+    commit = run_git(["rev-parse", "--short", "HEAD"], layer).stdout.strip()
+    print(f"committed layer {name} at {commit} ({changed} saved path(s) changed)")
+    return 0
+
+
+def git_show_path(root: Path, rel: str) -> bytes | None:
+    result = subprocess.run(
+        ["git", "show", f"HEAD:{rel}"],
+        cwd=str(root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def text_lines(data: bytes) -> list[str]:
+    try:
+        return data.decode().splitlines(keepends=True)
+    except UnicodeDecodeError:
+        return ["<binary content>\n"]
+
+
+def command_diff(args: argparse.Namespace) -> int:
+    root = repo_root()
+    if args.name_or_path:
+        candidate = sanitize_name(args.name_or_path)
+        if candidate in applied_layer_names(root):
+            manifest = load_manifest(root, candidate)
+            layer = Path(manifest["layer_dir"])
+            paths = [entry["path"] for entry in manifest["paths"]]
+        else:
+            layer = Path(args.name_or_path).expanduser().resolve()
+            paths = [rel for rel, _source in iter_layer_files(layer)]
+    else:
+        name = resolve_layer_name(root, None)
+        manifest = load_manifest(root, name)
+        layer = Path(manifest["layer_dir"])
+        paths = [entry["path"] for entry in manifest["paths"]]
+
+    wrote = False
+    for rel in sorted(paths):
+        base = git_show_path(root, rel)
+        source = layer / rel
+        overlay = read_bytes_or_empty(source)
+        if base == overlay:
+            continue
+        base_lines = text_lines(base or b"")
+        overlay_lines = text_lines(overlay)
+        fromfile = f"a/{rel}" if base is not None else "/dev/null"
+        tofile = f"b/{rel}"
+        for line in difflib.unified_diff(base_lines, overlay_lines, fromfile=fromfile, tofile=tofile):
+            sys.stdout.write(line)
+        wrote = True
+    if not wrote:
+        print("layer has no diff against HEAD")
+    return 0
+
+
+def command_filter(args: argparse.Namespace) -> int:
+    root = repo_root()
+    manifest = load_manifest(root, args.name)
+    entry = find_manifest_entry(manifest, args.path)
+    content = sys.stdin.buffer.read()
+    if entry is None or entry_mode(entry) != "partial":
+        sys.stdout.buffer.write(content)
+        return 0
+    transformed = transform_with_hunks(content, entry.get("hunks", []), args.direction, entry["path"])
+    sys.stdout.buffer.write(transformed)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="git layers",
+        description="Apply local patch-layer directories on top of a Git worktree.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    init_parser = sub.add_parser("init", help="create a Git-backed layer directory")
+    init_parser.add_argument("layer", help="layer directory to create or initialize")
+    init_parser.add_argument("--name", help="layer name to use with --apply")
+    init_parser.add_argument("--apply", action="store_true", help="also apply the empty layer here")
+    init_parser.set_defaults(func=command_init)
+
+    apply_parser = sub.add_parser("apply", help="apply a layer directory")
+    apply_parser.add_argument("layer", help="directory containing overlay files")
+    apply_parser.add_argument("--name", help="stable name for the applied layer")
+    apply_parser.add_argument("--force", action="store_true", help="overwrite dirty target paths")
+    apply_parser.add_argument("--allow-empty", action="store_true", help="apply a layer with no files yet")
+    apply_parser.add_argument(
+        "--partial",
+        action="store_true",
+        help="use clean/smudge filters for tracked files so normal Git subtracts layer hunks",
+    )
+    apply_parser.set_defaults(func=command_apply)
+
+    unapply_parser = sub.add_parser("unapply", help="remove an applied layer and restore backups")
+    unapply_parser.add_argument("name", nargs="?", help="layer name; optional when only one is applied")
+    unapply_parser.add_argument("--force", action="store_true", help="discard worktree edits to layer files")
+    unapply_parser.set_defaults(func=command_unapply)
+
+    status_parser = sub.add_parser("status", help="show layer status and normal Git status")
+    status_parser.set_defaults(func=command_status)
+
+    list_parser = sub.add_parser("list", help="list applied layers")
+    list_parser.set_defaults(func=command_list)
+
+    save_parser = sub.add_parser("save", help="copy current overlay files back to the layer directory")
+    save_parser.add_argument("name", nargs="?", help="layer name; optional when only one is applied")
+    save_parser.set_defaults(func=command_save)
+
+    track_parser = sub.add_parser("track", help="add worktree files to an applied layer")
+    track_parser.add_argument("paths", nargs="+", help="files or directories to track in the layer")
+    track_parser.add_argument("--layer", help="layer name; optional when only one is applied")
+    track_parser.add_argument(
+        "--mode",
+        choices=("auto", "partial", "overlay"),
+        default="auto",
+        help="auto uses partial for tracked files and overlay for untracked files",
+    )
+    track_parser.add_argument("--force", action="store_true", help="allow staged tracked files")
+    track_parser.set_defaults(func=command_track)
+
+    commit_parser = sub.add_parser("commit", help="save and commit the applied layer repo")
+    commit_parser.add_argument("name", nargs="?", help="layer name; optional when only one is applied")
+    commit_parser.add_argument("-m", "--message", required=True, help="commit message for the layer repo")
+    commit_parser.add_argument("--init", action="store_true", help="initialize the layer as a Git repo first")
+    commit_parser.add_argument("--allow-empty", action="store_true", help="create an empty layer commit")
+    commit_parser.set_defaults(func=command_commit)
+
+    diff_parser = sub.add_parser("diff", help="show the layer patch against HEAD")
+    diff_parser.add_argument(
+        "name_or_path",
+        nargs="?",
+        help="applied layer name or layer directory; optional when only one is applied",
+    )
+    diff_parser.set_defaults(func=command_diff)
+
+    filter_parser = sub.add_parser("filter", help="internal clean/smudge filter driver")
+    filter_parser.add_argument("direction", choices=("clean", "smudge"))
+    filter_parser.add_argument("--name", required=True)
+    filter_parser.add_argument("--path", required=True)
+    filter_parser.set_defaults(func=command_filter)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except LayerError as exc:
+        die(str(exc))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
